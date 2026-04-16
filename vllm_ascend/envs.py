@@ -106,7 +106,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     # use fused op transpose_kv_cache_by_block, default is True
     "VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK": lambda: bool(
         int(os.getenv("VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK", "1"))
-    ),
+    ), 
+    "PD_DECODE_SKIP_PREPROCESS":
+    lambda: int(os.getenv("PD_DECODE_SKIP_PREPROCESS", '0')),
 }
 
 # end-env-vars-definition

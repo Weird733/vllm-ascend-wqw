@@ -37,3 +37,14 @@ if os.getenv("DYNAMIC_EPLB", "false").lower() in ("true", "1") or os.getenv("EXP
 
 if envs.VLLM_ASCEND_BALANCE_SCHEDULING:
     import vllm_ascend.patch.platform.patch_balance_schedule  # noqa
+
+
+if envs.PD_DECODE_SKIP_PREPROCESS:
+# PD场景首token提前返回、D节点跳过tokenize特性适配
+    import vllm_ascend.patch.platform.patch_async_llm  # noqa: F401
+    import vllm_ascend.patch.platform.patch_scheduler  # noqa: F401
+    import vllm_ascend.patch.platform.patch_serving_chat  # noqa: F401
+    import vllm_ascend.patch.platform.patch_serving_completion  # noqa: F401
+    import vllm_ascend.patch.platform.patch_serving_engine  # noqa: F401
+    import vllm_ascend.patch.platform.patch_data
+
