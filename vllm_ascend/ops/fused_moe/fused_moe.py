@@ -55,6 +55,7 @@ from vllm_ascend.utils import (
 
 @dataclass
 class FusedMoEResult:
+    routed_expert_before_act_evt: torch.npu.Event
     routed_out: torch.Tensor
     before_dispatch_evt: torch.npu.Event | None = None
     before_combine_evt: torch.npu.Event | None = None
@@ -63,6 +64,7 @@ class FusedMoEResult:
 @dataclass
 class FusedMoEEvents:
     before_routed_experts: torch.npu.Event
+    routed_expert_before_act_evt: torch.npu.Event
     before_dispatch: torch.npu.Event | None = field(default=None)
     before_combine: torch.npu.Event | None = field(default=None)
 
@@ -560,6 +562,7 @@ class AscendFusedMoE(FusedMoE):
                 routed_out=routed_out,
                 before_dispatch_evt=fused_experts_results.before_dispatch_evt,
                 before_combine_evt=fused_experts_results.before_combine_evt,
+                routed_expert_before_act_evt=fused_experts_results.routed_expert_before_act_evt,
             )
         else:
             # The vLLM FusedMoE forward_impl does not return events.
@@ -695,12 +698,20 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
             torch.npu.current_stream().wait_event(fused_moe_evts.before_routed_experts)
             # Execute the gate projection and activation concurrently with the
             # dispatch communication.
-            maybe_wait_event(fused_moe_evts.before_dispatch)
+            # maybe_wait_event(fused_moe_evts.before_dispatch)
             part1_out = self._shared_experts_part1(hidden_states)
             # Execute the down projection concurrently with the combine
             # communication.
             maybe_wait_event(fused_moe_evts.before_combine)
             shared_out = self._shared_experts_part2(hidden_states, part1_out)
+            # maybe_wait_event(fused_moe_evts.before_combine)
+            # shared_out = self._shared_experts_part2(hidden_states, part1_out)
+
+            shared_act = self._shared_experts.act_fn(part1_out)  # type: ignore
+            maybe_wait_event(fused_moe_evts.routed_expert_before_act_evt)
+            shared_out, _ = self._shared_experts.down_proj(
+                shared_act)  # type: ignore
+
 
         # Make sure the default stream waits for the shared experts stream to
         # finish.
@@ -746,6 +757,7 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
                     before_routed_experts=before_routed_experts,
                     before_dispatch=fused_moe_results.before_dispatch_evt,
                     before_combine=fused_moe_results.before_combine_evt,
+                    routed_expert_before_act_evt=fused_moe_results.routed_expert_before_act_evt,
                 ),
             )
 

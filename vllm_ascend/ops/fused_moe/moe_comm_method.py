@@ -77,6 +77,7 @@ class FusedExpertsResult:
     # For dynamic_eplb
     group_list_type: int = 1
     expert_tokens: torch.Tensor | None = None
+    routed_expert_before_act_evt: torch.npu.Event | None = None
 
 
 class MoECommMethod(ABC):
@@ -141,7 +142,8 @@ class MoECommMethod(ABC):
             use_fusion_ops=self.use_fusion_ops,
         )
 
-        mlp_output = self._apply_mlp(mlp_compute_input)
+      
+        mlp_output, routed_expert_before_act_evt = self._apply_mlp(mlp_compute_input)
 
         before_combine_evt = torch.npu.current_stream().record_event()
         routed_out = self.token_dispatcher.token_combine(
@@ -155,6 +157,7 @@ class MoECommMethod(ABC):
             before_combine_evt=before_combine_evt,
             group_list_type=token_dispatch_output.group_list_type,
             expert_tokens=token_dispatch_output.group_list,
+            routed_expert_before_act_evt=routed_expert_before_act_evt,
         )
 
     def _apply_mlp(self, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:

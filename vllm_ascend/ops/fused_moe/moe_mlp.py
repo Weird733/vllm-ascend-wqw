@@ -112,7 +112,7 @@ def quant_apply_mlp(
             raise NotImplementedError("MXFP path does not support scale_bias yet.")
         if w1_offset is not None or w2_offset is not None:
             raise NotImplementedError("MXFP path does not support antiquant offset yet.")
-
+    routed_expert_before_act_evt = None
     if w1_offset is not None:
         unquantized_hidden_states = hidden_states
         quantized_hidden_states = None
@@ -178,6 +178,7 @@ def quant_apply_mlp(
             )[0]
             if quantized_hidden_states is not None:
                 dispose_tensor(quantized_hidden_states)
+            routed_expert_before_act_evt = torch.npu.current_stream().record_event()
             # act_fn: swiglu
             hidden_states, swiglu_out_scale = torch_npu.npu_dequant_swiglu_quant(
                 x=hidden_states,
@@ -285,6 +286,7 @@ def quant_apply_mlp(
             )[0]
             if quantized_hidden_states is not None:
                 dispose_tensor(quantized_hidden_states)
+            routed_expert_before_act_evt = torch.npu.current_stream().record_event()
             # act_fn: swiglu
             if HAS_TRITON:
                 from vllm_ascend.ops.triton.activation.swiglu_quant import swiglu_quant
@@ -313,7 +315,7 @@ def quant_apply_mlp(
             bias=bias2,
             fallback_output_dtype=_output_dtype,
         )
-    return hidden_states
+    return hidden_states, routed_expert_before_act_evt
 
 
 def unquant_apply_mlp(
@@ -360,7 +362,7 @@ def unquant_apply_mlp(
         group_type=0,
         group_list=group_list,
     )[0]
-    return hidden_states
+    return hidden_states, None
 
 
 def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
