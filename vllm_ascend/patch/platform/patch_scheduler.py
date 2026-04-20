@@ -19,61 +19,53 @@ from vllm.v1.request import Request
 from vllm_ascend import envs as envs_ascend
  
  
-def _update_waiting_for_remote_kv(self, request: Request) -> bool:
-    """
-    KV Connector: check if the request_id is finished_recving.
- 
-    The finished_recving_kv_req_ids list is populated
-    on the previous steps()'s update_from_output based
-    on the worker side connector.
- 
-    When the kv transfer is ready, we cache the blocks
-    and the request state will be moved back to WAITING from
-    WAITING_FOR_REMOTE_KV.
-    """
-    if request.request_id not in self.finished_recving_kv_req_ids:
-        return False
- 
-    if request.request_id in self.failed_recving_kv_req_ids:
-        # Request had KV load failures; num_computed_tokens was already
-        # updated in _update_requests_with_invalid_blocks
-        if request.num_computed_tokens:
-            # Cache any valid computed tokens.
-            self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
+def _update_waiting_for_remote_kv(self, request: Request) -> None:
+        """
+        KV Connector: update request state after async recv is finished.
+
+        When the kv transfer is ready, we cache the blocks
+        and the request state will be moved back to WAITING from
+        WAITING_FOR_REMOTE_KV.
+        """
+        # assert self.connector is not None
+
+        if request.request_id in self.failed_recving_kv_req_ids:
+            # Request had KV load failures; num_computed_tokens was already
+            # updated in _update_requests_with_invalid_blocks
+            if request.num_computed_tokens:
+                # Cache any valid computed tokens.
+                self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
+            else:
+                # No valid computed tokens, release allocated blocks.
+                # There may be a local cache hit on retry.
+                self.kv_cache_manager.free(request)
+
+            self.failed_recving_kv_req_ids.remove(request.request_id)
         else:
-            # No valid computed tokens, release allocated blocks.
-            # There may be a local cache hit on retry.
-            self.kv_cache_manager.free(request)
- 
-        self.failed_recving_kv_req_ids.remove(request.request_id)
-    else:
-        # Now that the blocks are ready, actually cache them.
-        (block_ids,) = self.kv_cache_manager.get_block_ids(request.request_id)
-        num_computed_tokens = len(block_ids) * self.block_size
-        # Handle the case where num request tokens less than one block.
-        num_computed_tokens = min(num_computed_tokens, request.num_tokens)
-        if num_computed_tokens == request.num_tokens:
-            num_computed_tokens -= 1
-        # This will cache the blocks iff caching is enabled.
-        self.kv_cache_manager.cache_blocks(request, num_computed_tokens)
- 
+            # Now that the blocks are ready, actually cache them.
+            # This will cache the blocks iff caching is enabled.
+            self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
+
+            # on a full prompt hit, we need to re-compute the last token
+            # in order to be able to sample the next token
+            if request.num_computed_tokens == request.num_tokens:
+                request.num_computed_tokens = request.num_tokens - 1
+
+            # Count the number of prefix cached tokens.
+            if request.num_cached_tokens < 0:
+                request.num_cached_tokens = request.num_computed_tokens
+
+        # adaptor begin: reuse prfilled tokens
+        if envs_ascend.PD_DECODE_SKIP_PREPROCESS:
+            if request.sampling_params.extra_args['kv_transfer_params'] \
+                    and "prefilled_token" in request.sampling_params.extra_args['kv_transfer_params']:
+                request.prompt_token_ids.extend(request.sampling_params.extra_args['kv_transfer_params']['prefilled_token'])
+                request.append_output_token_ids(request.sampling_params.extra_args['kv_transfer_params']['prefilled_token'])
+    
         # Update the request state for scheduling.
-        request.num_computed_tokens = num_computed_tokens
- 
-    # adaptor begin: reuse prfilled tokens
-    if envs_ascend.PD_DECODE_SKIP_PREPROCESS:
-        if request.sampling_params.extra_args['kv_transfer_params'] \
-                and "prefilled_token" in request.sampling_params.extra_args['kv_transfer_params']:
-            request.prompt_token_ids.extend(request.sampling_params.extra_args['kv_transfer_params']['prefilled_token'])
-            request.append_output_token_ids(request.sampling_params.extra_args['kv_transfer_params']['prefilled_token'])
- 
-    # Update the request state for scheduling.
-    request.num_computed_tokens = request.num_tokens - 1
-    # adaptor end
- 
-    # Return that we are ready.
-    self.finished_recving_kv_req_ids.remove(request.request_id)
-    return True
+        request.num_computed_tokens = request.num_tokens - 1
+        # adaptor end   
+        self.finished_recving_kv_req_ids.remove(request.request_id)
  
  
 from vllm.v1.core.sched.scheduler import Scheduler
