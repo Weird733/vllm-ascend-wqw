@@ -45,6 +45,7 @@ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.utils import ConstantList, record_function_or_nullcontext
+from vllm_ascend import envs
 
 
 # `spec_manager_map` in single_type_kv_cache_manager is a module-level dict
@@ -124,6 +125,7 @@ class RecomputeScheduler(Scheduler):
             "qwen3_next" in self.vllm_config.model_config.hf_text_config.model_type
             or "qwen3_5" in self.vllm_config.model_config.hf_text_config.model_type
         )
+        self._pending_first_tokens = {}
 
     def add_request(self, request: Request) -> None:
         existing = self.requests.get(request.request_id)
@@ -144,7 +146,7 @@ class RecomputeScheduler(Scheduler):
                 request.streaming_queue = deque()
             # Fill in placeholder tokens to enable full graph compatibility. Without
             # placeholders, graph matching may fail, forcing eager mode execution.
-            if self.is_kv_producer and self.is_hybrid_model and request.num_tokens > 1:
+            if self.is_kv_producer and self.is_hybrid_model and request.num_tokens > 1 and not envs.REUSE_PREFILLED_TOKENS:
                 request.prompt_token_ids.pop()
                 request._all_token_ids.pop()
                 request.num_prompt_tokens -= 1
@@ -211,6 +213,20 @@ class RecomputeScheduler(Scheduler):
             if request.num_cached_tokens < 0:
                 request.num_cached_tokens = request.num_computed_tokens
 
+            # Store first_token in request's kv_transfer_params
+            if envs.REUSE_PREFILLED_TOKENS:
+                pending_first_tokens = getattr(self, '_pending_first_tokens', {})
+                if request.request_id in pending_first_tokens:
+                    request.prompt_token_ids.extend([pending_first_tokens[request.request_id]])
+                    request.append_output_token_ids(pending_first_tokens[request.request_id])
+                    request.num_computed_tokens += 1
+                    request.update_block_hashes()
+                    logger.debug(
+                        f"Added first_token {pending_first_tokens[request.request_id]} to request {request.request_id} in _update_waiting_for_remote_kv")
+                    # Clean up the stored first_token
+                    del pending_first_tokens[request.request_id]
+
+        # Return that we are ready.
         self.finished_recving_kv_req_ids.remove(request.request_id)
 
     def schedule(self) -> RecomputeSchedulerOutput:
@@ -989,6 +1005,11 @@ class RecomputeScheduler(Scheduler):
 
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:
+            # Store first_tokens in request's kv_transfer_params
+            logger.debug(f"kv_connector_output:{kv_connector_output}")
+            if envs.REUSE_PREFILLED_TOKENS and kv_connector_output.first_tokens:
+                self._pending_first_tokens.update(kv_connector_output.first_tokens)
+                logger.debug(f"Stored first_tokens for requests: {list(kv_connector_output.first_tokens.keys())}")
             self._update_from_kv_xfer_finished(kv_connector_output)
 
         # collect KV cache events from KV cache manager

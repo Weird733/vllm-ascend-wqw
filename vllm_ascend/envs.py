@@ -107,6 +107,8 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK": lambda: bool(
         int(os.getenv("VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK", "1"))
     ),
+    # layerwise 是否重用prefiill的首token
+    "REUSE_PREFILLED_TOKENS": lambda: bool(int(os.getenv("REUSE_PREFILLED_TOKENS", "0"))),
 }
 
 # end-env-vars-definition

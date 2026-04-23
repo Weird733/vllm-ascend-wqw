@@ -50,3 +50,6 @@ import vllm_ascend.patch.worker.patch_v2.patch_input_batch  # noqa
 import vllm_ascend.patch.worker.patch_v2.patch_model_state  # noqa
 import vllm_ascend.patch.worker.patch_v2.patch_block_table  # noqa
 import vllm_ascend.patch.worker.patch_deepencoder2  # noqa
+
+if envs_ascend.REUSE_PREFILLED_TOKENS:
+    import vllm_ascend.patch.worker.patch_kv_connector

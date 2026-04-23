@@ -68,6 +68,8 @@ from vllm_ascend.distributed.kv_transfer.utils.utils import (
 )
 from vllm_ascend.utils import npu_stream_switch, trans_nd_to_nz
 
+import vllm_ascend.envs as envs_ascend
+
 # isort: off
 if TYPE_CHECKING:
     from vllm.v1.attention.backend import AttentionMetadata  # type: ignore
@@ -77,7 +79,7 @@ if TYPE_CHECKING:
 # isort: on
 
 DONE_SENDING_MSG = b"done_sending_msg"
-
+FIRST_TOKEN_MSG = b"first_token_msg"
 
 @dataclass
 class LayerMetadata:
@@ -529,6 +531,7 @@ class KVCacheRecvingLayerThread(threading.Thread):
         self.task_tracker = dict[str, int]()
         self.ready_event = ready_event
         self.metadata = metadata
+        self.first_tokens = dict[str, Any]()
 
     def get_and_clear_finished_requests(self) -> set[str]:
         """
@@ -540,6 +543,14 @@ class KVCacheRecvingLayerThread(threading.Thread):
             finished_requests = self.done_requests
             self.done_requests = set()
         return finished_requests
+
+    def get_first_token(self, request_id: str) -> Any:
+        with self.lock:
+            return self.first_tokens.get(get_external_request_id(request_id))
+
+    def clear_first_token(self, request_id: str):
+        with self.lock:
+            self.first_tokens.pop(get_external_request_id(request_id), None)
 
     def update_task(self, req_id, trans_count):
         with self.lock:
@@ -582,6 +593,13 @@ class KVCacheRecvingLayerThread(threading.Thread):
                         request_id = msg[1]
                         trans_count = msg[2]
                         self.update_task(request_id, trans_count)
+                        sock.send_multipart((identity, b"", b"ACK"))
+                    elif msg[0] == FIRST_TOKEN_MSG:
+                        external_request_id = msg[1]
+                        first_token = msg[2]
+                        logger.debug(f"receive first_token:{first_token}, request_id:{external_request_id}")
+                        with self.lock:
+                            self.first_tokens[external_request_id] = first_token
                         sock.send_multipart((identity, b"", b"ACK"))
                     else:
                         logger.error("Connection listener got unexpected message %s", msg)
@@ -636,6 +654,7 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
         assert vllm_config.kv_transfer_config is not None
         self.engine_id = vllm_config.kv_transfer_config.engine_id
         self._connector_metadata = MooncakeLayerwiseConnectorMetadata()
+        self.is_kv_consumer = vllm_config.kv_transfer_config.is_kv_consumer
 
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler: MooncakeLayerwiseConnectorScheduler | None = MooncakeLayerwiseConnectorScheduler(
@@ -691,7 +710,26 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         """Get the finished recving and sending requests."""
         assert self.connector_worker is not None
-        return self.connector_worker.get_finished()
+        finished_sending, finished_recving = self.connector_worker.get_finished()
+
+        # Collect first_tokens for finished requests
+        if envs_ascend.REUSE_PREFILLED_TOKENS:
+            first_tokens = None
+            if self.is_kv_consumer:
+                first_tokens = {}
+                for req_id in finished_recving:
+                    first_token = self.connector_worker.get_first_token(req_id)
+                    logger.debug(f"this first_token:{first_token}, req_id:{req_id}")
+                    if first_token is not None:
+                        first_tokens[req_id] = first_token
+                        self.connector_worker.clear_first_token(req_id)
+            return finished_sending, finished_recving, first_tokens
+        else:
+            return finished_sending, finished_recving
+
+    def send_prefilled_tokens(self, scheduler_output: SchedulerOutput, req_ids, token_ids):
+        assert self.connector_worker is not None
+        return self.connector_worker.send_prefilled_tokens(scheduler_output, req_ids, token_ids)
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
@@ -715,6 +753,15 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
     def wait_for_save(self):
         """MooncakeLayerwiseConnector does not save explicitly."""
         pass
+
+    def get_first_token(self, request_id: str) -> Any:
+        if self.connector_worker:
+            return self.connector_worker.get_first_token(request_id)
+        return None
+
+    def clear_first_token(self, request_id: str):
+        if self.connector_worker:
+            self.connector_worker.clear_first_token(request_id)
 
 
 class MooncakeLayerwiseConnectorScheduler:
@@ -1073,6 +1120,10 @@ class MooncakeLayerwiseConnectorWorker:
         self.v_quant_buffer: torch.Tensor | None = None
         self.virtual_request: set[str] = set()
 
+
+        self.req_send_done_tasks = {}
+        self.req_send_done_tasks_lock = threading.Lock()
+
     def create_kv_buffer(self, first_kv_cache_tuple):
         alignment = 2 * 1024 * 1024
         buffer_list = []
@@ -1220,6 +1271,9 @@ class MooncakeLayerwiseConnectorWorker:
             layer_metadata=self.layer_metadata,
         )
         if self.vllm_config.kv_transfer_config.is_kv_producer:
+            callback_func = self.send_done_send_signal
+            if envs_ascend.REUSE_PREFILLED_TOKENS:
+                callback_func = self.get_send_done_req
             ready_event = threading.Event()
             self.kv_send_layer_thread = KVCacheSendingLayerThread(
                 engine=self.engine,
@@ -1242,7 +1296,7 @@ class MooncakeLayerwiseConnectorWorker:
                 k_quant_buffer=self.k_quant_buffer,
                 v_quant_buffer=self.v_quant_buffer,
                 resharding_stream=self.resharding_stream,
-                callback_func=self.send_done_send_signal,
+                callback_func=callback_func,
             )
             self.kv_send_layer_thread.start()
             ready_event.wait()
@@ -1279,6 +1333,19 @@ class MooncakeLayerwiseConnectorWorker:
                 f"Number of completed KV cache recv requests: {len(done_recving)}, receive requests: {done_recving}"
             )
         return set(), done_recving
+
+    def get_first_token(self, request_id: str) -> Any:
+        if self.vllm_config.kv_transfer_config.is_kv_consumer and self.kv_recv_layer_thread:
+            return self.kv_recv_layer_thread.get_first_token(request_id)
+
+    def clear_first_token(self, request_id: str):
+        """
+        Clear the first token for a given request ID.
+        Args:
+            request_id: The request ID to clear the first token for.
+        """
+        if self.vllm_config.kv_transfer_config.is_kv_consumer and self.kv_recv_layer_thread:
+            self.kv_recv_layer_thread.clear_first_token(request_id)
 
     # {(ip, port)]: {local_block_ids: [], remote_block_ids: {}}}
     def _get_kv_split_metadata(self, req_meta: ReqMeta, req_idx: int, req_id: str, group_idx: int):
@@ -1670,6 +1737,21 @@ class MooncakeLayerwiseConnectorWorker:
                     continue
                 logger.debug(f"Add request {req_id} to kv send layer thread. {req_meta_update=}")
                 layer_send_task.send_request[req_id] = req_meta_update
+                with self.req_send_done_tasks_lock:
+                    if self.tp_rank == 0:
+                        if req_id not in self.req_send_done_tasks:
+                            self.req_send_done_tasks[req_id] = (req_meta_update, None, None, 0)
+                        else:
+                            first_token = self.req_send_done_tasks[req_id][2]
+                            computed_tokens = self.req_send_done_tasks[req_id][3]
+                            if computed_tokens < req_meta_update.prompt_len:
+                                first_token = None
+                            self.req_send_done_tasks[req_id] = (
+                                req_meta_update,
+                                self.req_send_done_tasks[req_id][1],
+                                first_token,
+                                computed_tokens,
+                            )
 
             self.kv_send_layer_thread.send_queue.put(layer_send_task)
             self.current_layer += 1
@@ -1748,6 +1830,91 @@ class MooncakeLayerwiseConnectorWorker:
         req_meta.remote_te_rpc_port = self.remote_te_port[req_meta.remote_engine_id][req_meta.remote_port]
         req_meta.remote_layer_metadata = self.remote_layer_metadata[req_meta.remote_engine_id][req_meta.remote_port]
         return req_meta
+
+    def get_send_done_req(self, req_id, req_meta, group_idx):
+        if self.tp_rank != 0:
+            self.send_done_send_signal(req_id, req_meta, group_idx)
+            return
+        with self.req_send_done_tasks_lock:
+            assert req_id in self.req_send_done_tasks
+            first_token = self.req_send_done_tasks[req_id][2]
+            self.req_send_done_tasks[req_id] = (
+                self.req_send_done_tasks[req_id][0],
+                group_idx,
+                first_token,
+                self.req_send_done_tasks[req_id][3],
+            )
+            if first_token is not None:
+                self._send_token_and_done_send_signal(self.req_send_done_tasks, req_id)
+
+    def send_prefilled_tokens(self, scheduler_output: SchedulerOutput, req_ids, token_ids):
+        if self.tp_rank != 0:
+            return
+        assert len(req_ids) == len(token_ids)
+        cached_reqs = scheduler_output.scheduled_cached_reqs
+        new_reqs = scheduler_output.scheduled_new_reqs
+        scheduled_spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
+        computed_tokens = dict(
+            list(zip(cached_reqs.req_ids, cached_reqs.num_computed_tokens))
+            + [(x.req_id, x.num_computed_tokens) for x in new_reqs]
+        )
+        done_sending = {}
+        with self.req_send_done_tasks_lock:
+            for req_id ,token_id in zip(req_ids, token_ids):
+                assert len(token_id) >= 1
+                spec_decode_tokens = (
+                    len(scheduled_spec_decode_tokens[req_id]) if (req_id in scheduled_spec_decode_tokens) else 0
+                )
+                num_scheduled_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+                computed_token = computed_tokens.get(req_id, 0) + num_scheduled_tokens - spec_decode_tokens
+                if req_id not in self.req_send_done_tasks:
+                    self.req_send_done_tasks[req_id] = (None, None, token_id[0], computed_token)
+                    continue
+                req_meta = self.req_send_done_tasks[req_id][0]
+                group_idx = self.req_send_done_tasks[req_id][1]
+                if req_meta is not None and computed_token >= req_meta.prompt_len:
+                    self.req_send_done_tasks[req_id] = (
+                        req_meta,
+                        group_idx,
+                        token_id[0],
+                        computed_token
+                    )
+                    if group_idx is not None:
+                        done_sending[req_id] = self.req_send_done_tasks.pop(req_id)
+        done_sending_to_process = list(done_sending.keys())
+        for req_id in done_sending_to_process:
+            self._send_token_and_done_send_signal(done_sending, req_id)
+
+    def _send_token_and_done_send_signal(self, req_send_done_tasks, req_id):
+        assert req_id in req_send_done_tasks
+        req_meta, group_idx, token_id, _ = req_send_done_tasks.pop(req_id)
+        if req_meta is None or group_idx is None or token_id is None:
+            logger.warning(
+                f"Invalid of req_id {req_id}, req_meta: {req_meta}, group_idx: {group_idx}, token_id: {token_id}"
+            )
+            return
+        external_req_id = get_external_request_id(req_id)
+        logger.info(
+            "Sending first token for request %s to %s:%d",
+            external_req_id,
+            req_meta.remote_host,
+            req_meta.remote_port,
+        )
+        try:
+            path = make_zmq_path("tcp", req_meta.remote_host, req_meta.remote_port)
+            msg_encoder = msgspec.msgpack.Encoder()
+            encoded_data = msg_encoder.encode((FIRST_TOKEN_MSG, external_req_id, token_id))
+            with zmq_ctx(zmq.REQ, path) as sock:  # type: ignore
+                ensure_zmq_send(sock, encoded_data, f"{req_meta.remote_host}:{req_meta.remote_port}")
+                ack = sock.recv()
+                if ack != b"ACK":
+                    raise ValueError(f"Unexpected ACK response: {ack}")
+        except Exception as e:
+            logger.error(
+                f"Sending first token for request {external_req_id} to "
+                f"{req_meta.remote_host}:{req_meta.remote_port} fail with error: {e}"
+            )
+        self.send_done_send_signal(req_id, req_meta, group_idx)
 
     def send_done_send_signal(self, req_id, req_meta, group_idx):
         external_req_id = get_external_request_id(req_id)

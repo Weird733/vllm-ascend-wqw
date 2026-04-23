@@ -141,6 +141,8 @@ from vllm_ascend.ascend_forward_context import (  # isort: skip
 )
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import RoutedExpertsCapturer
 
+import vllm_ascend.envs as envs_ascend
+
 if TYPE_CHECKING:
     import xgrammar as xgr  # type: ignore[import-untyped]
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -1623,6 +1625,16 @@ class NPUModelRunner(GPUModelRunner):
             pp = get_pp_group()
             if pp.world_size > 1 and pp.is_last_rank:
                 self._pp_broadcast_prev_sampled_token_ids(sampler_output.sampled_token_ids)
+
+        if self.is_kv_producer and envs_ascend.REUSE_PREFILLED_TOKENS:
+            req_ids = model_runner_output.req_ids
+            token_ids = model_runner_output.sampled_token_ids
+            if self.use_async_scheduling:
+                token_ids = sampler_output.sampled_token_ids.tolist()
+            if hasattr(self, 'send_prefilled_tokens'):
+                self.send_prefilled_tokens(scheduler_output, req_ids, token_ids)
+            else:
+                logger.warning("set REUSE_PREFILLED_TOKENS, but no send_prefilled_tokens method")
 
         if not self.use_async_scheduling:
             return model_runner_output

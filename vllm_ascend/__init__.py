@@ -14,7 +14,7 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
-
+import vllm_ascend.envs as envs_ascend
 
 def register():
     """Register the NPU platform."""
@@ -24,7 +24,8 @@ def register():
 
 def register_connector():
     from vllm_ascend.distributed.kv_transfer import register_connector
-
+    if envs_ascend.REUSE_PREFILLED_TOKENS:
+        import vllm_ascend.patch.worker.patch_kv_utils
     register_connector()
 
 
